@@ -33,6 +33,23 @@ class ConfigurationTest < Minitest::Test
     end
   end
 
+  def test_a_non_numeric_value_falls_back_to_the_default_with_a_warning
+    log = StringIO.new
+    ActiveStorage.logger = ActiveSupport::Logger.new(log)
+
+    with_env("IMGPROXY_TIMEOUT" => "10s", "IMGPROXY_MAX_BYTES" => "64MB") do
+      config = ActiveStorage::Imgproxy::Configuration.new
+
+      assert_equal 10, config.timeout
+      assert_equal 64 * 1024 * 1024, config.max_bytes
+    end
+
+    assert_match(/IMGPROXY_TIMEOUT is not a number/, log.string)
+    assert_match(/IMGPROXY_MAX_BYTES is not a number/, log.string)
+  ensure
+    ActiveStorage.logger = ActiveSupport::Logger.new(IO::NULL)
+  end
+
   def test_it_is_disabled_when_anything_is_missing
     with_env("IMGPROXY_URL" => nil, "IMGPROXY_KEY" => nil, "IMGPROXY_SALT" => nil) do
       refute_predicate ActiveStorage::Imgproxy::Configuration.new, :enabled?

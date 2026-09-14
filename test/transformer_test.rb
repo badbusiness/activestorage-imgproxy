@@ -171,6 +171,86 @@ class TransformerTest < Minitest::Test
     assert_match(/RuntimeError: something nobody thought of/, events.first.payload[:error])
   end
 
+  # B3: a 200 is not proof that imgproxy sent an image. Whatever comes back is
+  # stored as *the* variant and never regenerated, because #processed? only asks
+  # the service whether the key exists -- so a bad body is permanent damage.
+  def test_an_empty_200_falls_back
+    stub_imgproxy(body: "")
+    variant = user_with_avatar.avatar.variant(**RESIZE).processed
+
+    assert_equal vanilla_variant_bytes(RESIZE), variant.download
+  end
+
+  def test_a_200_that_is_not_an_image_falls_back_without_leaking_the_body
+    secret = "https://bucket.s3.example.com/x?X-Amz-Signature=deadbeef"
+    stub_imgproxy(body: "error: can't download #{secret}")
+    log = StringIO.new
+    ActiveStorage.logger = ActiveSupport::Logger.new(log)
+
+    events = captured_imgproxy_events do
+      assert_equal vanilla_variant_bytes(RESIZE), user_with_avatar.avatar.variant(**RESIZE).processed.download
+    end
+
+    refute_includes log.string, "X-Amz-Signature"
+    refute_includes events.first.payload[:error].to_s, "X-Amz-Signature"
+    assert_match(/not a png image/, events.first.payload[:error])
+  ensure
+    ActiveStorage.logger = ActiveSupport::Logger.new(IO::NULL)
+  end
+
+  # A real image, but not the format that was asked for -- an
+  # IMGPROXY_FALLBACK_IMAGE, or a misrouted request.
+  def test_a_200_in_the_wrong_format_falls_back
+    stub_imgproxy(body: File.binread(ImgproxyTestHelper::FIXTURE))
+    variant = user_with_avatar.avatar.variant(**RESIZE).processed
+
+    assert_equal vanilla_variant_bytes(RESIZE), variant.download
+  end
+
+  def test_the_expected_format_is_accepted
+    stub_imgproxy(body: File.binread(ImgproxyTestHelper::FIXTURE))
+    variant = user_with_avatar.avatar.variant(resize_to_limit: [ 100, 100 ], format: :jpg).processed
+
+    assert_equal File.binread(ImgproxyTestHelper::FIXTURE), variant.download
+  end
+
+  # B2: everything before ImgproxyTransformer#attempt is on the imgproxy path
+  # too, and must not be able to turn a variant into a 500.
+  def test_an_error_raised_before_the_attempt_still_falls_back
+    stub_imgproxy
+    expected = vanilla_variant_bytes(RESIZE)
+
+    broken = Object.new
+    def broken.enabled? = raise("configuration blew up")
+
+    previous = ActiveStorage::Imgproxy.config
+    ActiveStorage::Imgproxy.instance_variable_set(:@config, broken)
+
+    assert_equal expected, user_with_avatar.avatar.variant(**RESIZE).processed.download
+  ensure
+    ActiveStorage::Imgproxy.instance_variable_set(:@config, previous)
+  end
+
+  # "10s" in a deploy file used to raise ArgumentError on every single variant,
+  # from the lazily built configuration, outside every rescue the gem had.
+  def test_a_non_numeric_timeout_in_the_environment_does_not_break_variants
+    stub_imgproxy
+    ENV["IMGPROXY_TIMEOUT"] = "10s"
+    ENV["IMGPROXY_URL"] = ImgproxyTestHelper::IMGPROXY_URL
+    ENV["IMGPROXY_KEY"] = ImgproxyTestHelper::KEY
+    ENV["IMGPROXY_SALT"] = ImgproxyTestHelper::SALT
+    ENV["IMGPROXY_SOURCE_HOST"] = ImgproxyTestHelper::SOURCE_HOST
+    ActiveStorage::Imgproxy.reset_config!
+
+    assert_equal ActiveStorage::Imgproxy::Configuration::DEFAULT_TIMEOUT,
+      ActiveStorage::Imgproxy.config.timeout
+    assert_equal ImgproxyTestHelper::TRANSFORMED_PNG,
+      user_with_avatar.avatar.variant(**RESIZE).processed.download
+  ensure
+    %w[IMGPROXY_TIMEOUT IMGPROXY_URL IMGPROXY_KEY IMGPROXY_SALT IMGPROXY_SOURCE_HOST].each { |k| ENV.delete(k) }
+    configure_imgproxy!
+  end
+
   def test_an_untranslatable_transformation_falls_back_without_calling_imgproxy
     stub = stub_imgproxy
     variant = user_with_avatar.avatar.variant(rotate: 90, format: :png).processed

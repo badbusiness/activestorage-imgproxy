@@ -66,6 +66,15 @@ module ActiveStorage
         )
 
         with_blob(blob) { transformer.attempt(blob, format: variation.format) }
+      rescue => error
+        # ImgproxyTransformer#attempt guards everything it does, but the few
+        # lines above it are on the imgproxy path too: config.enabled? reads
+        # configuration that is built lazily from the environment, and
+        # variation.format validates the requested format. Neither may turn a
+        # variant into a 500 -- the stock path runs next and will raise the same
+        # thing itself if it really is the app's problem.
+        logger&.warn("[activestorage-imgproxy] falling back to the stock transformer: #{error.class}: #{error.message}")
+        nil
       end
 
       # Prepends the hooks the gem needs. Idempotent, and safe to call again

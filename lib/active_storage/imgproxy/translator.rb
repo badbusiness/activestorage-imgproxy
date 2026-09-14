@@ -39,8 +39,6 @@ module ActiveStorage
         options = []
 
         transformations.each do |name, argument|
-          next if argument.nil?
-
           options.concat(translate(name, argument))
         end
 

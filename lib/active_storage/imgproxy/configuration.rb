@@ -35,10 +35,10 @@ module ActiveStorage
         @key = presence(ENV["IMGPROXY_KEY"])
         @salt = presence(ENV["IMGPROXY_SALT"])
         @source_host = presence(ENV["IMGPROXY_SOURCE_HOST"])
-        @url_expires_in = integer(ENV["IMGPROXY_URL_EXPIRES_IN"], DEFAULT_URL_EXPIRES_IN)
-        @open_timeout = integer(ENV["IMGPROXY_OPEN_TIMEOUT"], DEFAULT_OPEN_TIMEOUT)
-        @timeout = integer(ENV["IMGPROXY_TIMEOUT"], DEFAULT_TIMEOUT)
-        @max_bytes = integer(ENV["IMGPROXY_MAX_BYTES"], DEFAULT_MAX_BYTES)
+        @url_expires_in = integer("IMGPROXY_URL_EXPIRES_IN", DEFAULT_URL_EXPIRES_IN)
+        @open_timeout = integer("IMGPROXY_OPEN_TIMEOUT", DEFAULT_OPEN_TIMEOUT)
+        @timeout = integer("IMGPROXY_TIMEOUT", DEFAULT_TIMEOUT)
+        @max_bytes = integer("IMGPROXY_MAX_BYTES", DEFAULT_MAX_BYTES)
         @enabled = boolean(ENV["IMGPROXY_ENABLED"], true)
       end
 
@@ -101,8 +101,21 @@ module ActiveStorage
           value if value && !value.strip.empty?
         end
 
-        def integer(value, default)
-          value.present? ? Integer(value) : default
+        # "10s" in a deploy file must not take the app down. Configuration is
+        # built lazily, on the first variant, so a bare Integer() here would
+        # raise ArgumentError on every single transformation for the lifetime of
+        # the process -- outside every rescue the gem has, because it happens
+        # before the imgproxy path is even entered.
+        def integer(name, default)
+          value = ENV[name]
+          return default if value.blank?
+
+          Integer(value)
+        rescue ArgumentError, TypeError
+          ActiveStorage::Imgproxy.logger&.warn(
+            "[activestorage-imgproxy] #{name} is not a number (#{value.inspect}), using #{default}"
+          )
+          default
         end
 
         def boolean(value, default)

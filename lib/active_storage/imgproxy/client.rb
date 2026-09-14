@@ -11,15 +11,20 @@ module ActiveStorage
     # Fetches a transformed image from imgproxy over plain HTTP and streams it
     # straight to disk.
     #
-    # Retry policy, on purpose a narrow one:
+    # Retry policy, on purpose a narrow one, and the only one in play: Net::HTTP
+    # retries idempotent requests once *by itself* (max_retries defaults to 1,
+    # and its retry list covers Net::ReadTimeout, IOError, EOFError and
+    # ECONNRESET), which silently doubled everything below. #perform therefore
+    # sets max_retries = 0 and this class does all the counting.
     #
     # * a refused/reset connection or an unresolvable host is retried once --
     #   imgproxy was not there, so nothing was done twice;
     # * a 5xx is retried once -- imgproxy answered, but not with an image;
-    # * a *timeout* is never retried. A timeout means imgproxy is probably still
-    #   busy with the first request; asking again doubles the work on a service
-    #   that is already struggling, and doubles the time this thread is held.
-    #   Falling back to vips right away is both faster and kinder.
+    # * a *timeout* is never retried, so a hung imgproxy costs one read_timeout
+    #   and not two. A timeout means imgproxy is probably still busy with the
+    #   first request; asking again doubles the work on a service that is
+    #   already struggling, and doubles the time this thread is held. Falling
+    #   back to vips right away is both faster and kinder.
     # * a 4xx is never retried -- imgproxy will not change its mind about a
     #   malformed or forbidden request.
     #
@@ -31,8 +36,11 @@ module ActiveStorage
 
       # "imgproxy was not reachable", and nothing was transferred: safe to ask
       # once more. Timeouts are deliberately absent.
+      # EOFError is here as well as ECONNRESET: whether a peer that goes away
+      # before answering surfaces as a reset or as an unexpected EOF depends on
+      # the platform and on the timing, and both mean the same thing.
       RETRIABLE_ERRORS = [
-        Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::EPIPE, SocketError
+        Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::EPIPE, EOFError, SocketError
       ].freeze
 
       # "imgproxy did not answer properly", but asking again would not help or
@@ -42,6 +50,27 @@ module ActiveStorage
         Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError,
         OpenSSL::SSL::SSLError, Zlib::Error
       ].freeze
+
+      # File signatures for the formats Active Storage can be asked for. A
+      # format that is not in here is accepted on the status code alone.
+      JPEG = ->(header) { header.start_with?("\xFF\xD8\xFF".b) }
+      TIFF = ->(header) { header.start_with?("II*\x00".b) || header.start_with?("MM\x00*".b) }
+      ISOBMFF = ->(brands) {
+        ->(header) { header[4, 4] == "ftyp".b && brands.include?(header[8, 4]) }
+      }
+
+      MAGIC = {
+        "png" => ->(header) { header.start_with?("\x89PNG\r\n\x1A\n".b) },
+        "jpg" => JPEG,
+        "jpeg" => JPEG,
+        "gif" => ->(header) { header.start_with?("GIF8".b) },
+        "webp" => ->(header) { header.start_with?("RIFF".b) && header[8, 4] == "WEBP".b },
+        "avif" => ISOBMFF.call([ "avif".b, "avis".b ]),
+        "heic" => ISOBMFF.call([ "heic".b, "heix".b, "heim".b, "heis".b, "mif1".b ]),
+        "tif" => TIFF,
+        "tiff" => TIFF,
+        "bmp" => ->(header) { header.start_with?("BM".b) }
+      }.freeze
 
       def initialize(config)
         @config = config
@@ -60,6 +89,7 @@ module ActiveStorage
           get(uri, into: tempfile)
           tempfile.flush
           tempfile.rewind
+          verify!(tempfile, extension: extension)
           succeeded = true
           tempfile
         ensure
@@ -93,6 +123,9 @@ module ActiveStorage
 
           http = Net::HTTP.new(uri.host, uri.port)
           http.use_ssl = uri.scheme == "https"
+          # Net::HTTP's own retry would turn "one attempt" into two, doubling
+          # both the work on imgproxy and the time this thread is held.
+          http.max_retries = 0
           http.open_timeout = config.open_timeout
           http.read_timeout = config.timeout
           http.write_timeout = config.timeout
@@ -128,6 +161,29 @@ module ActiveStorage
 
             into.write(chunk)
           end
+        end
+
+        # A 200 is not proof that imgproxy sent an image. An error page, an
+        # IMGPROXY_FALLBACK_IMAGE, or a truncated body all arrive as a perfectly
+        # normal 200 -- and whatever comes back is stored as *the* variant and
+        # never regenerated, because ActiveStorage::Variant#processed? only asks
+        # the service whether the key exists. So the bytes are checked before
+        # they are handed over, and anything that is not the requested format
+        # falls back to vips instead.
+        def verify!(tempfile, extension:)
+          size = tempfile.size
+          raise RequestFailed, "imgproxy returned an empty response" if size.zero?
+
+          matches = MAGIC[extension.to_s.downcase]
+          return if matches.nil? # a format this gem has no signature for
+
+          header = tempfile.read(16).to_s.b
+          tempfile.rewind
+          return if matches.call(header)
+
+          # The body itself is never reported: an imgproxy error page echoes the
+          # signed source URL it was handed.
+          raise RequestFailed, "imgproxy returned #{size} bytes that are not a #{extension} image"
         end
 
         def too_large!(bytes)
