@@ -53,7 +53,7 @@ ActiveStorage::Imgproxy.configure do |config|
   config.source_host    = ENV["IMGPROXY_SOURCE_HOST"] # only needed for the Disk service
   config.url_expires_in = 300                         # seconds the source URL is valid
   config.open_timeout   = 2                           # seconds to get a connection
-  config.timeout        = 10                          # seconds to read the response
+  config.timeout        = 8                           # seconds to read the response
   config.max_bytes      = 64 * 1024 * 1024            # refuse anything bigger
   config.enabled        = true
 end
@@ -76,7 +76,7 @@ And the optional ones:
 | `IMGPROXY_SOURCE_HOST` | — | **Required for the Disk service.** Absolute URL of the app *as imgproxy reaches it*, e.g. `https://app.example.com`. |
 | `IMGPROXY_URL_EXPIRES_IN` | `300` | Lifetime of the source URL handed to imgproxy. |
 | `IMGPROXY_OPEN_TIMEOUT` | `2` | Seconds to get a connection to imgproxy. |
-| `IMGPROXY_TIMEOUT` | `10` | Seconds to read the response. |
+| `IMGPROXY_TIMEOUT` | `8` | Seconds to read the response. Must stay below the container's own `IMGPROXY_TIMEOUT` (10 by default). |
 | `IMGPROXY_MAX_BYTES` | `67108864` | Hard ceiling on the response. Anything bigger falls back. |
 | `IMGPROXY_ENABLED` | `true` | `false`/`0`/`no`/`off` switches the gem off completely. |
 
@@ -85,14 +85,20 @@ silently inert and everything runs on the stock transformer. That is the intende
 behaviour in development and CI. The same is true when Active Storage itself has
 variants switched off (`config.active_storage.variant_processor = :disabled`).
 
+The numeric variables are parsed leniently: a value that is not a number
+(`IMGPROXY_TIMEOUT=10s` is the classic) logs one warning and falls back to the
+default. A typo in a deploy file must not be able to break every variant in the
+app.
+
 ### Keep the gem's timeout below imgproxy's
 
-The container has its own `IMGPROXY_TIMEOUT` (default 10 s in imgproxy itself),
+The container has its own `IMGPROXY_TIMEOUT` (10 s by default in imgproxy itself),
 which bounds how long *it* will spend fetching and processing a source image.
-**The gem's `IMGPROXY_TIMEOUT` must be lower than the container's**, so that the
+**The gem's `IMGPROXY_TIMEOUT` must stay lower than the container's**, so that the
 app gives up first and the fallback starts while imgproxy is still working — rather
-than the app waiting out imgproxy's own timeout and only then starting vips. If you
-raise one, raise the other by more.
+than the app waiting out imgproxy's own timeout and only then starting vips. That
+is why the gem's default is **8 s against imgproxy's 10 s**. If you raise one,
+raise the other by more.
 
 A timeout is deliberately **not** retried, by this gem *or* by Net::HTTP. A timeout
 means imgproxy is probably still busy with the first request; asking again doubles
@@ -144,6 +150,11 @@ On Disk-service apps, therefore:
 
 `IMGPROXY_ALLOWED_SOURCES` must include the host the source URLs point at — the S3
 bucket host, or the app host for Disk-service apps.
+
+The gem talks to `IMGPROXY_URL` **directly, never through an HTTP proxy**, even when
+`http_proxy`/`HTTP_PROXY` is set in the app's environment for outbound calls
+(`Net::HTTP.new` would otherwise pick it up from `ENV` by default). imgproxy is an
+internal service and is expected to be reachable without one.
 
 ## What is translated
 
@@ -216,10 +227,12 @@ The gem falls back to the stock transformer (whatever
 - imgproxy times out — **not** retried;
 - imgproxy answers any other non-200 — not retried, since it will not change its mind;
 - imgproxy answers **200 with something that is not the requested image** — an empty
-  body, an error page, or an `IMGPROXY_FALLBACK_IMAGE` in another format. The first
-  bytes are checked against the file signature for the requested format, because a
-  variant is written once and then never regenerated (`#processed?` only asks the
-  service whether the key exists), so a bad body would be permanent;
+  body, an error page, an `IMGPROXY_FALLBACK_IMAGE` in another format, or a body that
+  stops short of its `Content-Length`. The first bytes are checked against the file
+  signature for the requested format, the byte count is checked against the announced
+  length, and a format the gem has no signature for is refused outright. All of this
+  because a variant is written once and then never regenerated (`#processed?` only
+  asks the service whether the key exists), so a bad body would be permanent;
 - the response is larger than `IMGPROXY_MAX_BYTES`;
 - anything else goes wrong at all. The rescue is deliberately as wide as
   `StandardError`: a typo in a URL, a full disk, an exhausted file-descriptor

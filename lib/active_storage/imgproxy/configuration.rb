@@ -12,12 +12,14 @@ module ActiveStorage
     class Configuration
       DEFAULT_URL_EXPIRES_IN = 300
 
-      # Deliberately short. A slow imgproxy must never hold a web thread: the
-      # stock vips path is the correct answer, just a slower one. These must
-      # stay *below* the container's own IMGPROXY_TIMEOUT, so that the gem gives
-      # up before imgproxy does and no work is left running on the other side.
+      # Deliberately short, and deliberately below imgproxy's own default
+      # IMGPROXY_TIMEOUT of 10 seconds: the app has to give up before the
+      # container does, so the fallback starts while imgproxy is still working
+      # rather than after it has already answered. A slow imgproxy must never
+      # hold a web thread -- the stock vips path is the correct answer, just a
+      # slower one.
       DEFAULT_OPEN_TIMEOUT = 2
-      DEFAULT_TIMEOUT = 10
+      DEFAULT_TIMEOUT = 8
 
       # Hard ceiling on the response imgproxy is allowed to stream back. A
       # variant that does not fit is a misconfiguration, not something to buffer.

@@ -16,7 +16,7 @@ class ConfigurationTest < Minitest::Test
       assert_equal "https://app.example.com", config.source_host
       assert_equal 300, config.url_expires_in
       assert_equal 2, config.open_timeout
-      assert_equal 10, config.timeout
+      assert_equal 8, config.timeout
       assert_equal 64 * 1024 * 1024, config.max_bytes
       assert config.enabled?
     end
@@ -40,7 +40,7 @@ class ConfigurationTest < Minitest::Test
     with_env("IMGPROXY_TIMEOUT" => "10s", "IMGPROXY_MAX_BYTES" => "64MB") do
       config = ActiveStorage::Imgproxy::Configuration.new
 
-      assert_equal 10, config.timeout
+      assert_equal 8, config.timeout
       assert_equal 64 * 1024 * 1024, config.max_bytes
     end
 
