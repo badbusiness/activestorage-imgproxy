@@ -2,6 +2,10 @@
 
 ENV["RAILS_ENV"] = "test"
 
+# The gem reads its defaults from the environment, so a developer machine that
+# happens to have IMGPROXY_* set must not be able to change what the suite sees.
+ENV.keys.grep(/\AIMGPROXY_/).each { |key| ENV.delete(key) }
+
 require "rails"
 require "active_model/railtie"
 require "active_record/railtie"
@@ -23,6 +27,10 @@ module Dummy
     config.secret_key_base = "a" * 64
     config.logger = ActiveSupport::Logger.new(IO::NULL)
     config.active_record.sqlite3_adapter_strict_strings_by_default = true
+
+    # Nothing may run in the background: the suite asserts on exactly which
+    # service calls a transformation makes, and blob analysis downloads.
+    config.active_job.queue_adapter = :test
 
     config.active_storage.service_configurations = {
       "local" => { "service" => "Disk", "root" => STORAGE_ROOT }
@@ -84,6 +92,13 @@ end
 
 module ImgproxyTestHelper
   FIXTURE = File.expand_path("fixtures/sample.jpg", __dir__)
+  IMGPROXY_URL = "http://imgproxy.test:8080"
+  SOURCE_HOST = "http://app.example.com"
+
+  # key "secret" (hex), salt "hello" (hex) -- the pair from the imgproxy
+  # signing documentation, so the signature can be checked against its vector.
+  KEY = "736563726574"
+  SALT = "68656c6c6f"
 
   # A 1x1 PNG, enough to prove the bytes came back from imgproxy untouched.
   TRANSFORMED_PNG = [
@@ -94,15 +109,7 @@ module ImgproxyTestHelper
   def setup
     super
     WebMock.disable_net_connect!
-    ActiveStorage::Imgproxy.reset_config!
-    ActiveStorage::Imgproxy.configure do |config|
-      config.url = "http://imgproxy:8080"
-      config.key = "736563726574"
-      config.salt = "68656c6c6f"
-      config.source_host = "http://dashboard.test"
-      config.enabled = true
-      config.timeout = 1
-    end
+    configure_imgproxy!
     ActiveStorage::Imgproxy.install!
   end
 
@@ -114,6 +121,23 @@ module ImgproxyTestHelper
     ActiveStorage::Blob.delete_all
   end
 
+  # Every value is set explicitly. reset_config! rebuilds from the environment,
+  # which is exactly what a test must not depend on.
+  def configure_imgproxy!
+    ActiveStorage::Imgproxy.reset_config!
+    ActiveStorage::Imgproxy.configure do |config|
+      config.url = IMGPROXY_URL
+      config.key = KEY
+      config.salt = SALT
+      config.source_host = SOURCE_HOST
+      config.url_expires_in = 300
+      config.open_timeout = 1
+      config.timeout = 1
+      config.max_bytes = ActiveStorage::Imgproxy::Configuration::DEFAULT_MAX_BYTES
+      config.enabled = true
+    end
+  end
+
   def user_with_avatar
     user = User.create!(name: "Martijn")
     user.avatar.attach(io: File.open(FIXTURE), filename: "sample.jpg", content_type: "image/jpeg")
@@ -121,9 +145,44 @@ module ImgproxyTestHelper
   end
 
   def stub_imgproxy(status: 200, body: TRANSFORMED_PNG, &block)
-    stub = stub_request(:get, %r{\Ahttp://imgproxy:8080/})
-    stub = block ? stub.to_return(&block) : stub.to_return(status: status, body: body)
-    stub
+    stub = stub_request(:get, %r{\A#{Regexp.escape(IMGPROXY_URL)}/})
+    block ? stub.to_return(&block) : stub.to_return(status: status, body: body)
+  end
+
+  # The exact URL the gem is expected to request for this blob and variation.
+  # Only deterministic under a frozen clock, because the signed source URL
+  # carries an expiry.
+  def expected_imgproxy_url(blob, transformations)
+    variation = ActiveStorage::Variation.wrap(transformations)
+    config = ActiveStorage::Imgproxy.config
+    options = ActiveStorage::Imgproxy::Translator.new(variation.transformations.except(:format)).call
+
+    source_url =
+      begin
+        previous = ActiveStorage::Current.url_options
+        ActiveStorage::Current.url_options = config.source_url_options
+        blob.url(expires_in: config.url_expires_in)
+      ensure
+        ActiveStorage::Current.url_options = previous
+      end
+
+    ActiveStorage::Imgproxy::UrlBuilder.new(config).build(
+      source_url: source_url, options: options, extension: variation.format
+    )
+  end
+
+  # minitest 6 no longer ships minitest/mock, and this is the one place the
+  # suite has to inject a failure that the gem has no idea about.
+  def with_exploding_client(message)
+    original = ActiveStorage::Imgproxy.send(:remove_const, :Client)
+    exploding = Class.new do
+      define_method(:initialize) { |_config| raise message }
+    end
+    ActiveStorage::Imgproxy.const_set(:Client, exploding)
+    yield
+  ensure
+    ActiveStorage::Imgproxy.send(:remove_const, :Client)
+    ActiveStorage::Imgproxy.const_set(:Client, original)
   end
 
   def captured_imgproxy_events
@@ -133,6 +192,19 @@ module ImgproxyTestHelper
     end
     yield
     events
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
+
+  # Names of the Active Storage service calls made inside the block. Used to
+  # prove that the imgproxy path never downloads the original.
+  def captured_service_events
+    names = []
+    subscriber = ActiveSupport::Notifications.subscribe(/\.active_storage\z/) do |name, *|
+      names << name
+    end
+    yield
+    names
   ensure
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end

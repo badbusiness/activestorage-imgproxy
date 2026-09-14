@@ -39,10 +39,17 @@ module ActiveStorage
           Base64.urlsafe_encode64(digest, padding: false)
         end
 
+        # pack("H*") happily turns "not hex at all" into bytes by looking at the
+        # low nibble of every character, so the string has to be checked before
+        # it is decoded -- otherwise a typo in IMGPROXY_KEY produces a perfectly
+        # well-formed signature that imgproxy rejects with a 403 on every single
+        # variant.
         def hex(value)
-          [ value.to_s ].pack("H*").tap do |binary|
-            raise MissingConfiguration, "imgproxy key and salt must be hex encoded" if binary.empty?
+          unless Configuration::HEX.match?(value.to_s)
+            raise MissingConfiguration, "imgproxy key and salt must be hex encoded"
           end
+
+          [ value.to_s ].pack("H*")
         end
     end
   end

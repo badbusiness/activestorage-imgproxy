@@ -13,8 +13,8 @@ require "active_storage/imgproxy/configuration"
 require "active_storage/imgproxy/translator"
 require "active_storage/imgproxy/url_builder"
 require "active_storage/imgproxy/client"
-require "active_storage/imgproxy/ext/blob_tracking"
-require "active_storage/imgproxy/ext/variation"
+require "active_storage/imgproxy/ext/variant"
+require "active_storage/imgproxy/ext/variant_with_record"
 require "active_storage/transformers/imgproxy_transformer"
 
 module ActiveStorage
@@ -55,21 +55,36 @@ module ActiveStorage
         @config = Configuration.new
       end
 
-      # Prepends the two hooks the gem needs. Idempotent, and safe to call
-      # again after a code reload, because it checks the ancestors of the
-      # (possibly new) class objects rather than a global flag.
+      # Runs the variation on imgproxy. Returns an open, rewound Tempfile with
+      # the transformed image, or nil when the caller should run the stock
+      # Active Storage path instead. Never raises on the imgproxy path.
+      def transform(blob, variation)
+        return nil unless config.enabled?
+
+        transformer = ActiveStorage::Transformers::ImgproxyTransformer.new(
+          variation.transformations.except(:format)
+        )
+
+        with_blob(blob) { transformer.attempt(blob, format: variation.format) }
+      end
+
+      # Prepends the hooks the gem needs. Idempotent, and safe to call again
+      # after a code reload, because it checks the ancestors of the (possibly
+      # new) class objects rather than a global flag.
       def install!
-        install_module(ActiveStorage::Variation, Ext::Variation)
-        install_module(ActiveStorage::Variant, Ext::BlobTracking)
-        install_module(ActiveStorage::VariantWithRecord, Ext::BlobTracking)
+        install_module(ActiveStorage::Variant, Ext::Variant)
+        install_module(ActiveStorage::VariantWithRecord, Ext::VariantWithRecord)
         true
       end
 
       def installed?
-        ActiveStorage::Variation.ancestors.include?(Ext::Variation)
+        ActiveStorage::Variant.ancestors.include?(Ext::Variant) &&
+          ActiveStorage::VariantWithRecord.ancestors.include?(Ext::VariantWithRecord)
       end
 
-      # Publishes the blob being transformed for the duration of the block.
+      # Publishes the blob being transformed for the duration of the block, so
+      # that ImgproxyTransformer can also be used through the plain Transformer
+      # interface.
       def with_blob(blob)
         previous = Thread.current[BLOB_KEY]
         Thread.current[BLOB_KEY] = blob

@@ -26,8 +26,34 @@ class TranslatorTest < Minitest::Test
     assert_equal [ "rs:fill:100:200:1", "g:sm" ], translate(resize_to_fill: [ 100, 200, { crop: "attention" } ])
   end
 
-  def test_resize_and_pad_extends_the_canvas
-    assert_equal [ "rs:fit:100:200:1", "ex:1:ce" ], translate(resize_and_pad: [ 100, 200 ])
+  # vips pads with its own default (black, or transparent when the source has
+  # an alpha channel) and imgproxy pads with IMGPROXY_BACKGROUND. Rather than
+  # guess which one the app meant, an implicit background falls back.
+  def test_resize_and_pad_without_a_background_is_rejected
+    assert_raises(ActiveStorage::Imgproxy::UnsupportedTransformation) { translate(resize_and_pad: [ 100, 200 ]) }
+  end
+
+  # ImageProcessing adds an alpha channel before padding; imgproxy has no
+  # equivalent, and silently dropping it would produce an opaque image where
+  # the app asked for a transparent one.
+  def test_resize_and_pad_with_alpha_is_rejected
+    assert_raises(ActiveStorage::Imgproxy::UnsupportedTransformation) do
+      translate(resize_and_pad: [ 100, 200, { background: [ 0, 0, 0 ], alpha: true } ])
+    end
+  end
+
+  def test_resize_and_pad_gravity
+    assert_equal [ "rs:fit:100:200:1", "ex:1:no", "bg:ffffff" ],
+      translate(resize_and_pad: [ 100, 200, { gravity: "north", background: "#ffffff" } ])
+  end
+
+  def test_bad_background_channels_are_rejected
+    assert_raises(ActiveStorage::Imgproxy::UnsupportedTransformation) do
+      translate(resize_and_pad: [ 100, 200, { background: [ "white", 0, 0 ] } ])
+    end
+    assert_raises(ActiveStorage::Imgproxy::UnsupportedTransformation) do
+      translate(resize_and_pad: [ 100, 200, { background: [ 300, 0, 0 ] } ])
+    end
   end
 
   def test_resize_and_pad_background

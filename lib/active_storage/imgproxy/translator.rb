@@ -85,13 +85,29 @@ module ActiveStorage
           segments
         end
 
+        # :alpha is deliberately *not* accepted: ImageProcessing adds an alpha
+        # channel before padding, which imgproxy has no equivalent for, and
+        # silently ignoring it would produce an opaque image where the app asked
+        # for a transparent one.
+        #
+        # A missing :background is not accepted either. vips pads with its own
+        # default (black, or transparent when the source has an alpha channel);
+        # imgproxy pads with IMGPROXY_BACKGROUND, which the gem cannot see. The
+        # two agree only when the app says what it wants, so anything else falls
+        # back to vips rather than guess at a colour.
         def resize_and_pad(argument)
           width, height, options = split(argument)
+          reject_unknown_options(:resize_and_pad, options, %i[gravity background])
 
-          segments = [ "rs:fit:#{width}:#{height}:1", "ex:1:#{padding_gravity(options[:gravity])}" ]
-          segments << background(options[:background]) if options.key?(:background)
-          reject_unknown_options(:resize_and_pad, options, %i[gravity background alpha])
-          segments
+          unless options.key?(:background)
+            raise UnsupportedTransformation, "resize_and_pad without an explicit background"
+          end
+
+          [
+            "rs:fit:#{width}:#{height}:1",
+            "ex:1:#{padding_gravity(options[:gravity])}",
+            background(options[:background])
+          ]
         end
 
         # resize_* arguments come in as [width, height] or [width, height, options].
@@ -135,7 +151,7 @@ module ActiveStorage
           when Array
             raise UnsupportedTransformation, "background must be three channels" unless value.size == 3
 
-            "bg:#{value.map { |channel| Integer(channel) }.join(':')}"
+            "bg:#{value.map { |channel| channel_value(channel) }.join(':')}"
           when String
             hex = value.delete_prefix("#")
             raise UnsupportedTransformation, "background must be a hex colour" unless hex.match?(/\A[0-9a-fA-F]{6}\z/)
@@ -144,6 +160,15 @@ module ActiveStorage
           else
             raise UnsupportedTransformation, "unsupported background #{value.inspect}"
           end
+        end
+
+        def channel_value(channel)
+          integer = Integer(channel)
+          raise UnsupportedTransformation, "background channel out of range #{channel.inspect}" unless integer.between?(0, 255)
+
+          integer
+        rescue ArgumentError, TypeError
+          raise UnsupportedTransformation, "non-numeric background channel #{channel.inspect}"
         end
 
         def reject_unknown_options(name, options, allowed)
