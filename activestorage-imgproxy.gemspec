@@ -25,6 +25,12 @@ Gem::Specification.new do |spec|
   spec.files = Dir["lib/**/*.rb", "README.md", "LICENSE.txt"]
   spec.require_paths = [ "lib" ]
 
-  spec.add_dependency "activestorage", ">= 7.1", "< 9"
-  spec.add_dependency "activesupport", ">= 7.1", "< 9"
+  # Only 8.1 is actually tested (see .github/workflows/ci.yml). The hook sits on
+  # two private methods of ActiveStorage::Variant and ActiveStorage::VariantWithRecord,
+  # so the supported range must not claim more than CI proves.
+  spec.add_dependency "activestorage", ">= 8.1", "< 9"
+  spec.add_dependency "activesupport", ">= 8.1", "< 9"
+
+  # base64 is a bundled gem from Ruby 3.4 on, and UrlBuilder needs it.
+  spec.add_dependency "base64"
 end
