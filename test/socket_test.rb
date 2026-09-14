@@ -25,10 +25,12 @@ class SocketTest < Minitest::Test
   end
 
   def teardown
-    @acceptor&.kill
-    @server&.close
+    # First, and before anything that can raise: leaving WebMock disabled would
+    # let every later test in the suite reach the network for real.
     WebMock.enable!
     WebMock.disable_net_connect!
+    @acceptor&.kill
+    @server&.close
     super
   end
 
@@ -92,11 +94,18 @@ class SocketTest < Minitest::Test
   end
 
   def test_a_real_socket_serves_the_variant
-    serve { |socket| read_request(socket); write_png(socket) }
+    request = nil
+    serve { |socket| request = read_request(socket); write_png(socket) }
 
     assert_equal ImgproxyTestHelper::TRANSFORMED_PNG,
       user_with_avatar.avatar.variant(**RESIZE).processed.download
     assert_equal 1, connections
+
+    # Net::HTTP asks for gzip unless told otherwise, and then inflates the body
+    # while Content-Length still describes the compressed one -- which would
+    # make the length check fail on every gzip response.
+    assert_match(/^accept-encoding: identity\r$/i, request)
+    refute_match(/gzip/i, request)
   end
 
   private

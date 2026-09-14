@@ -100,6 +100,24 @@ than the app waiting out imgproxy's own timeout and only then starting vips. Tha
 is why the gem's default is **8 s against imgproxy's 10 s**. If you raise one,
 raise the other by more.
 
+The three timeouts belong together and are set as one budget. The shared
+production container runs:
+
+| Where | Setting | Value |
+|---|---|---|
+| container | `IMGPROXY_TIMEOUT` | `10` s — the whole request, fetch and processing |
+| container | `IMGPROXY_DOWNLOAD_TIMEOUT` | `6` s — fetching the original from S3 or from the app |
+| gem | `IMGPROXY_TIMEOUT` | `8` s — reading imgproxy's response |
+| gem | `IMGPROXY_OPEN_TIMEOUT` | `2` s — getting a connection to imgproxy |
+
+Read it inside out. imgproxy gives up on a slow *source* after 6 s and answers
+with an error, which the gem turns into a fallback straight away — that is the
+cheap path, and it happens well inside the gem's 8 s. If imgproxy is slow for its
+own reasons, the gem gives up at 8 s, before imgproxy's own 10 s deadline, so the
+thread is released while the container is still busy instead of waiting for it to
+finish and then discarding the answer. Changing any one of these without the
+others inverts that order.
+
 A timeout is deliberately **not** retried, by this gem *or* by Net::HTTP. A timeout
 means imgproxy is probably still busy with the first request; asking again doubles
 the work on a service that is already struggling and holds the Ruby thread for
@@ -155,6 +173,12 @@ The gem talks to `IMGPROXY_URL` **directly, never through an HTTP proxy**, even 
 `http_proxy`/`HTTP_PROXY` is set in the app's environment for outbound calls
 (`Net::HTTP.new` would otherwise pick it up from `ENV` by default). imgproxy is an
 internal service and is expected to be reachable without one.
+
+It also asks for `Accept-Encoding: identity`. Net::HTTP requests gzip by default and
+transparently inflates the answer, while `Content-Length` keeps describing the
+*compressed* body — which would make the short-body check below see a mismatch on
+every gzip response and fall back every time, after paying for the transformation.
+An image is already compressed, so identity costs nothing.
 
 ## What is translated
 

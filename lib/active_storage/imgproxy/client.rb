@@ -83,6 +83,12 @@ module ActiveStorage
         "png" => ->(header) { header.start_with?("\x89PNG\r\n\x1A\n".b) },
         "jpg" => JPEG,
         "jpeg" => JPEG,
+        # Variation#format hands back the requested extension verbatim, and
+        # .jfif in particular is what Windows and Chrome produce on save.
+        "jfif" => JPEG,
+        "jpe" => JPEG,
+        "jif" => JPEG,
+        "jfi" => JPEG,
         "gif" => ->(header) { header.start_with?("GIF8".b) },
         "webp" => ->(header) { header.start_with?("RIFF".b) && header[8, 4] == "WEBP".b },
         "avif" => ISOBMFF.call(%w[avif avis mif1 miaf].map(&:b)),
@@ -164,10 +170,22 @@ module ActiveStorage
           http.write_timeout = config.timeout
 
           http.start do |session|
-            session.request(Net::HTTP::Get.new(uri)) do |response|
+            session.request(get_request(uri)) do |response|
               stream(response, into: into, expected: check!(response))
             end
           end
+        end
+
+        # Net::HTTP asks for gzip by default and transparently inflates the
+        # answer -- but Content-Length keeps describing the *compressed* body,
+        # so the length check below would see a mismatch on every single gzip
+        # response and fall back every single time, after paying for the
+        # transformation. An image is already compressed; identity costs
+        # nothing and keeps the byte count meaningful.
+        def get_request(uri)
+          request = Net::HTTP::Get.new(uri)
+          request["accept-encoding"] = "identity"
+          request
         end
 
         # Only the status code is ever reported. An imgproxy error body echoes
@@ -180,7 +198,9 @@ module ActiveStorage
           raise RetriableResponse, "imgproxy responded #{status}" if RETRIABLE_STATUS.cover?(status)
           raise RequestFailed, "imgproxy responded #{status}" unless status == 200
 
-          length = Integer(response["content-length"], exception: false)
+          # Base 10 explicitly: Integer() would otherwise read "068" as an
+          # invalid octal (nil) and "0x40" as 64.
+          length = Integer(response["content-length"].to_s, 10, exception: false)
           too_large!(length) if length && length > config.max_bytes
           length
         end
