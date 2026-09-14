@@ -37,7 +37,7 @@ the transformer — see [below](#why-the-hook-sits-on-variantprocess).
 
 ```ruby
 # Gemfile
-gem "activestorage-imgproxy", github: "badbusiness/activestorage-imgproxy", branch: "main"
+gem "activestorage-imgproxy", github: "badbusiness/activestorage-imgproxy", tag: "v0.2.0"
 ```
 
 No initializer is required: the railtie installs the hooks and every setting has an
@@ -94,10 +94,16 @@ app gives up first and the fallback starts while imgproxy is still working — r
 than the app waiting out imgproxy's own timeout and only then starting vips. If you
 raise one, raise the other by more.
 
-A timeout is deliberately **not** retried. A timeout means imgproxy is probably
-still busy with the first request; asking again doubles the work on a service that
-is already struggling and holds the Ruby thread for another full timeout. Falling
-back to vips right away is both faster and kinder.
+A timeout is deliberately **not** retried, by this gem *or* by Net::HTTP. A timeout
+means imgproxy is probably still busy with the first request; asking again doubles
+the work on a service that is already struggling and holds the Ruby thread for
+another full timeout. Falling back to vips right away is both faster and kinder.
+
+(Net::HTTP retries idempotent requests once on its own — `max_retries` defaults to
+`1`, and its retry list includes `Net::ReadTimeout`, `EOFError` and `ECONNRESET`.
+The gem sets `max_retries = 0` and does all the counting itself, so "retried once"
+means two requests and "never retried" means one. Without that, a hung imgproxy
+costs two full read timeouts.)
 
 ### The Disk service needs a host — and pays for it
 
@@ -146,8 +152,8 @@ bucket host, or the app host for Disk-service apps.
 | `resize_to_limit: [w, h]` | `rs:fit:w:h:0` | never enlarges |
 | `resize_to_fit: [w, h]` | `rs:fit:w:h:1` | |
 | `resize_to_fill: [w, h]` | `rs:fill:w:h:1` | |
-| `resize_to_fill: [w, h, crop: "north"]` | `rs:fill:w:h:1/g:no` | `centre`, `north`, `south`, `east`, `west` and the four corners are exact |
-| `resize_to_fill: [w, h, crop: "attention"/"entropy"]` | `rs:fill:w:h:1/g:sm` | **an approximation** — see below |
+| `resize_to_fill: [w, h, crop: "north"]` | `rs:fill:w:h:1/g:no` | exact: `centre`/`center`, `north`/`top`, `south`/`bottom`, `east`/`right`, `west`/`left`, and `north-east`, `north-west`, `south-east`, `south-west`. `gravity:` is accepted as a synonym of `crop:`. |
+| `resize_to_fill: [w, h, crop: "attention"/"entropy"/"smart"]` | `rs:fill:w:h:1/g:sm` | **an approximation** — see below |
 | `resize_and_pad: [w, h, background: [r, g, b] \| "#rrggbb"]` | `rs:fit:w:h:1/ex:1:ce/bg:…` | the background is **required** — see below |
 | a `nil` dimension | `0` | imgproxy derives it from the other one |
 | `format: :webp` | the URL extension | Active Storage handles this itself |
@@ -209,6 +215,11 @@ The gem falls back to the stock transformer (whatever
 - imgproxy answers 5xx — retried once;
 - imgproxy times out — **not** retried;
 - imgproxy answers any other non-200 — not retried, since it will not change its mind;
+- imgproxy answers **200 with something that is not the requested image** — an empty
+  body, an error page, or an `IMGPROXY_FALLBACK_IMAGE` in another format. The first
+  bytes are checked against the file signature for the requested format, because a
+  variant is written once and then never regenerated (`#processed?` only asks the
+  service whether the key exists), so a bad body would be permanent;
 - the response is larger than `IMGPROXY_MAX_BYTES`;
 - anything else goes wrong at all. The rescue is deliberately as wide as
   `StandardError`: a typo in a URL, a full disk, an exhausted file-descriptor
@@ -318,11 +329,14 @@ bundle exec rake test
 bundle exec rubocop
 ```
 
-Both run on every push and pull request (`.github/workflows/ci.yml`), on the Ruby in
-`.ruby-version`. The suite boots a real Rails application with a Disk service in
+Both run on every pull request and on every push to `main`
+(`.github/workflows/ci.yml`), on the Ruby in `.ruby-version`. The suite boots a real Rails application with a Disk service in
 `tmp/`, stubs imgproxy with WebMock, checks the signature against the test vector
 from the imgproxy documentation, and compares imgproxy's bytes against what vips
-would have produced — so it needs a real libvips.
+would have produced — so it needs a real libvips. `test/socket_test.rb` runs against
+a real `TCPServer` with WebMock switched off, because WebMock's `to_timeout` raises
+inside its own adapter and never reaches Net::HTTP's retry loop — a retry bug is
+invisible to it.
 
 Only Rails 8.1 is tested, and the gemspec says so. The hook sits on two private
 methods of `ActiveStorage::Variant` and `ActiveStorage::VariantWithRecord`; claiming
